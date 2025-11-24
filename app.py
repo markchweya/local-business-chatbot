@@ -3,22 +3,24 @@
 #   admin / admin123
 #   user  / user123
 #
+# Cloud-safe: uses ONLY Python stdlib for password hashing (no bcrypt)
 # Fixes included:
 # 1) TF-IDF "empty vocabulary" for small custom FAQ sets (dynamic min_df).
-# 2) Streamlit session_state user_input reset bug (use form clear_on_submit).
+# 2) Streamlit input reset bug (form clear_on_submit).
 #
-# Requirements:
-#   pip install streamlit openai datasets pandas scikit-learn pyarrow bcrypt
-#
-# Run:
-#   # PowerShell (temporary)
-#   $env:OPENAI_API_KEY="sk-..."
-#   streamlit run app.py
+# Requirements.txt can stay simple:
+# streamlit
+# openai
+# datasets
+# pandas
+# scikit-learn
+# pyarrow
 
 import os
 import re
 import sqlite3
-import bcrypt
+import base64
+import hashlib
 import pandas as pd
 import streamlit as st
 from datasets import load_dataset
@@ -41,6 +43,22 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
 # ----------------------------
+# PASSWORD HASHING (stdlib PBKDF2)
+# ----------------------------
+def hash_password(password: str, salt: bytes = None) -> str:
+    if salt is None:
+        salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+    return base64.b64encode(salt + key).decode()
+
+def verify_password(password: str, stored: str) -> bool:
+    raw = base64.b64decode(stored.encode())
+    salt, key = raw[:16], raw[16:]
+    new_key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+    return new_key == key
+
+
+# ----------------------------
 # STYLING (banking UI feel)
 # ----------------------------
 BANK_CSS = """
@@ -52,7 +70,6 @@ BANK_CSS = """
   --accent:#4cc9f0;
   --accent2:#80ffdb;
   --text:#e9edff;
-  --danger:#ff6b6b;
 }
 .stApp{
   background:
@@ -118,7 +135,7 @@ def get_conn():
 def seed_user_if_missing(c, username, password, role):
     c.execute("SELECT username FROM users WHERE username=?", (username,))
     if not c.fetchone():
-        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+        pw_hash = hash_password(password)
         c.execute(
             "INSERT INTO users(username,pw_hash,role) VALUES(?,?,?)",
             (username, pw_hash, role)
@@ -131,7 +148,7 @@ def init_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS users(
         username TEXT PRIMARY KEY,
-        pw_hash BLOB NOT NULL,
+        pw_hash TEXT NOT NULL,
         role TEXT NOT NULL CHECK(role IN ('user','admin'))
     );
     """)
@@ -174,7 +191,7 @@ def verify_user(username, password):
     if not row:
         return None
     pw_hash, role = row
-    if bcrypt.checkpw(password.encode(), pw_hash):
+    if verify_password(password, pw_hash):
         return role
     return None
 
@@ -254,7 +271,6 @@ def load_base_dataset():
     return base_df
 
 
-# ✅ dynamic min_df so tiny custom FAQ sets don't crash
 @st.cache_resource
 def build_vector_index(texts):
     texts = [t for t in texts if isinstance(t, str) and t.strip()]
@@ -316,21 +332,14 @@ def openai_fallback(query, context_snippets):
             "accounts, loans, cards, transfers, or mobile banking."
         ), 0.0, "fallback"
 
-    try:
-        from openai import OpenAI
-    except Exception:
-        return (
-            "OpenAI package not found. Install with `pip install openai`."
-        ), 0.0, "fallback"
-
+    from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     system = (
         "You are a helpful Kenyan retail-banking/SACCO support assistant. "
         "Answer ONLY using the provided context. "
         "If the context is insufficient, ask a short follow-up question. "
-        "Never provide investment advice, never request PINs or passwords. "
-        "Use a professional but friendly banking tone."
+        "Never request PINs or passwords. Use a professional banking tone."
     )
 
     user = (
@@ -434,8 +443,6 @@ def chat_page():
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
-
-    # ✅ FIX: use form with clear_on_submit=True instead of touching session_state directly
     with st.form("chat_form", clear_on_submit=True):
         col1, col2 = st.columns([5, 1])
         with col1:
